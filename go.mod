@@ -1,6 +1,6 @@
 module github.com/kris-watts-gravwell/goecharts
 
-go 1.27.3
+go 1.27.4
 
 require github.com/dop251/goja v0.0.0-20260917113740-793a2a65c13b
 
