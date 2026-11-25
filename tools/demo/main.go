@@ -31,7 +31,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -41,7 +40,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kris-watts-gravwell/goecharts"
+	"github.com/gravwell/goecharts"
 )
 
 const (
@@ -117,8 +116,6 @@ func failureReason(script []byte, errText string) string {
 		return "needs Baidu Maps (bmap), a browser SDK with online tiles"
 	case strings.Contains(src, "_echarts_instance_"):
 		return "needs a DOM element to drag (draggable.js)"
-	case strings.Contains(src, "type: 'heatmap'") && strings.Contains(src, "coordinateSystem: 'geo'"):
-		return "heatmap on a map paints blurred pixels into a canvas, which has no equivalent in SVG"
 	case strings.Contains(errText, "DOMParser") || strings.Contains(errText, "parsing XML"):
 		return "SVG map could not be parsed: " + errText
 	case strings.Contains(errText, "is not defined"):
@@ -207,6 +204,8 @@ func main() {
 	// Phase 2: serve, and render in the background.
 	r, err := goecharts.New(
 		goecharts.WithLoader(fetcher),
+		goecharts.WithImageLoader(fetcher),
+		goecharts.WithMaxConcurrency(*workers),
 		goecharts.WithTimeout(*timeout),
 		goecharts.WithPoolSize(*workers),
 		goecharts.WithFailOnError(false),
@@ -536,7 +535,7 @@ func (s *server) find(id string) *example {
 }
 
 func (s *server) svg(w http.ResponseWriter, req *http.Request) {
-	id := strings.TrimSuffix(path.Base(req.URL.Path), ".svg")
+	id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/svg/"), ".svg")
 	e := s.find(id)
 	if e == nil {
 		http.NotFound(w, req)
@@ -554,7 +553,7 @@ func (s *server) svg(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *server) thumb(w http.ResponseWriter, req *http.Request) {
-	id := path.Base(req.URL.Path)
+	id := strings.TrimPrefix(req.URL.Path, "/thumb/")
 	e := s.find(id)
 	if e == nil || e.thumbName == "" {
 		http.NotFound(w, req)
@@ -564,7 +563,7 @@ func (s *server) thumb(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *server) script(w http.ResponseWriter, req *http.Request) {
-	id := strings.TrimSuffix(path.Base(req.URL.Path), ".js")
+	id := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/script/"), ".js")
 	e := s.find(id)
 	if e == nil || e.script == nil {
 		http.NotFound(w, req)

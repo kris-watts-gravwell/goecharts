@@ -13,7 +13,7 @@ alerts, emails and dashboards without a browser in the loop.
 The package embeds the upstream ECharts 6 JavaScript bundle and runs it with
 [goja](https://github.com/dop251/goja), a JavaScript interpreter written in Go,
 in ECharts' own server-side rendering mode, which lays out and paints a chart
-with no DOM and serializes it with `renderToSVGString`. Go supplies what the
+with no DOM and writes out the SVG element tree ECharts builds. Go supplies what the
 headless runtime would otherwise take from a browser: text measurement, from
 width tables derived from the Liberation fonts, so axis, legend and label
 layout matches what a viewer will draw.
@@ -30,7 +30,7 @@ tests.
 ## Install
 
 ```bash
-go get github.com/kris-watts-gravwell/goecharts
+go get github.com/gravwell/goecharts
 ```
 
 ## A simple example
@@ -43,7 +43,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/kris-watts-gravwell/goecharts"
+	"github.com/gravwell/goecharts"
 )
 
 const option = `{
@@ -73,7 +73,8 @@ func main() {
 
 Create one `Renderer` per process and share it. It is safe for concurrent
 use: it compiles the JavaScript bundle once and keeps a pool of interpreter
-instances, each serving one render at a time.
+instances, each serving one render at a time. At most `GOMAXPROCS` renders
+run at once by default; further calls wait for a slot.
 
 ## Providing data
 
@@ -118,9 +119,14 @@ Renderer options:
 
 | Option | Default | Purpose |
 |---|---|---|
-| `WithTimeout` | 30s | Per-render wall clock limit; the interpreter is interrupted. |
+| `WithTimeout` | 30s | Per-render wall clock limit; the interpreter and canvas drawing are interrupted. Waiting for a render slot is bounded by the same duration. |
 | `WithPoolSize` | `NumCPU` | Idle interpreter instances kept for reuse. |
-| `WithLoader` | loading disabled | Resolve URLs that scripts load. |
+| `WithMaxConcurrency` | `GOMAXPROCS` | Renders in progress at once; others wait, up to the timeout. Zero or less removes the limit. |
+| `WithMaxInputBytes` | 256 MiB | Total size of a request plus everything it loads; exceeding it fails with `ErrInputTooLarge`. |
+| `WithMaxOutputBytes` | 256 MiB | Size of the returned SVG; exceeding it fails with `ErrOutputTooLarge`. |
+| `WithMaxCanvasPixels` | 64 megapixels | Canvas pixels a render may draw on, counted at each canvas's size when drawn; exceeding it fails with `ErrCanvasTooLarge`. |
+| `WithLoader` | loading disabled | Resolve URLs that scripts load, and a script's images when there is no image loader. |
+| `WithImageLoader` | image loading disabled | Fetch images named by an option or script, to learn their size. |
 | `WithLogger` | discard | Receive ECharts console output. |
 | `WithFailOnError` | true | Fail the render when ECharts logs at error level. |
 | `WithTextMeasurer` | built-in metrics | Replace the text width function used for layout. |
@@ -135,9 +141,15 @@ Renderer options:
 - **Interactive components** such as tooltips, the toolbox and data zoom
   render in their initial state; nothing responds to events in a static SVG.
 - **Images** are not embedded. An `image` graphic, symbol or pattern keeps
-  its URL in the SVG for the viewer to load; the Loader is consulted only
-  for the image's size, and a `graphic` image still needs explicit `width`
-  and `height`, as in ECharts' own SVG renderer.
+  its URL in the SVG for the viewer to load. With `WithImageLoader` the
+  image is fetched to learn its size, and this applies to a plain JSON
+  `Option` as much as to a script; without it only `data:` URLs are read. A
+  `graphic` image still needs explicit `width` and `height`, as in ECharts'
+  own SVG renderer.
+- **Heatmaps on a map** (`coordinateSystem: 'geo'`) are drawn by ECharts
+  into a canvas, pixel by pixel. They are rendered the same way here and
+  embedded in the SVG as a PNG picture, so that one layer is a raster and
+  does not scale like the rest of the chart.
 - **Maps** need their GeoJSON or SVG registered with `echarts.registerMap`
   from a script (see below); the JSON `Option` path has no way to do so.
 - **Unknown series or component types** are ignored without error, as the
@@ -202,15 +214,20 @@ patterns the examples use and nothing more:
 - `window` (the global object, with `innerWidth` and `innerHeight` set to
   the output size), `navigator`, `devicePixelRatio`, `addEventListener`
   and `matchMedia`.
-- `document`, whose `createElement` returns inert elements; a canvas has a
-  2D context that accepts any call and measures text, so a script that
-  paints a watermark runs, though the pattern it paints is not produced.
+- `document`, whose `createElement` returns inert elements, except that a
+  canvas has a partly working 2D context. It measures text, fills circles
+  and rectangles (with a blurred shadow), draws one canvas onto another,
+  and reads, writes and exports pixels; a canvas used as a picture is
+  embedded as a PNG. Every other call is accepted and draws nothing: no
+  text, general paths, strokes, gradients or transforms. So a script that
+  paints a text watermark runs, but the pattern comes out blank.
 - `DOMParser`, which parses XML in Go and returns the subset of the DOM
   that ECharts' SVG map parser walks, so `echarts.registerMap(name, {svg})`
   works.
-- `Image`, whose source is resolved through the Loader to learn the pixel
-  size (PNG, JPEG, GIF and SVG); the SVG keeps the URL and the viewer loads
-  the pixels. Images named in an option take the same path.
+- `Image`, whose source is resolved through the image loader
+  (`WithImageLoader`, separate from `WithLoader`) to learn the pixel size
+  (PNG, JPEG, GIF and SVG); the SVG keeps the URL and the viewer loads the
+  pixels. Images named in an option take the same path.
 - `XMLHttpRequest`, `structuredClone` and `$.getScript`, which evaluates a
   loaded script in the global scope so that UMD libraries such as d3 or
   ecStat define their globals.
@@ -248,10 +265,9 @@ and `-refresh` discards the cache.
 The tool supplies what the examples site gives every example before its
 script runs: `CDN_PATH` (jsdelivr), the `ecStat` plugin, and the `world`
 and `china` maps, each fetched only for the examples that use them. With
-ECharts 6.1.0, 370 of the 377 examples render. The rest need Baidu Maps,
-a real canvas (the heatmap on a geo map blurs pixels) or a DOM element to
-drag; the largest charts can also exceed `-timeout` when every worker is
-busy.
+ECharts 6.1.0, 371 of the 377 examples render. The rest need Baidu Maps or
+a DOM element to drag; the largest charts can also exceed `-timeout` when
+every worker is busy.
 
 ## Text measurement
 
@@ -272,11 +288,36 @@ ECharts formats time axis labels in the JavaScript runtime's local time zone,
 which goja takes from Go's `time.Local`. Set `TZ` or assign `time.Local` to
 control it, or set `useUTC: true` in the option.
 
+## Untrusted input
+
+A script is code. It runs in an interpreter with no file, network or process
+access of its own, and reaches the outside only through the loaders you
+configure, but within the interpreter it can do anything:
+
+- **Isolation between renders.** A script can redefine globals such as
+  `JSON.parse` or the `echarts` object, so an interpreter instance that ran
+  a script is discarded rather than returned to the pool. Script renders
+  therefore always pay the instance start-up cost; option renders reuse the
+  pool.
+- **Request forgery.** `WithLoader` is reached by scripts only.
+  `WithImageLoader` is also reached by plain JSON options, which can name
+  image URLs. Give either a loader that restricts where it fetches from.
+  A load counts against `WithMaxInputBytes` only once the loader returns
+  it, so a loader should also stop reading past `LoadLimit(ctx)` bytes.
+- **Memory.** The interpreter has no memory limit. `WithTimeout` bounds a
+  render's CPU time, `WithMaxConcurrency` bounds how many run at once, and
+  `WithMaxInputBytes`, `WithMaxOutputBytes` and `WithMaxCanvasPixels` bound
+  what a render takes in, returns and paints. The size defaults are deliberately very high; lower them to
+  what your charts need. Even so, a script can allocate until the process
+  runs out of memory, so render untrusted scripts in a process whose
+  memory is limited from outside, such as a container.
+
 ## Performance
 
 goja is an interpreter, roughly 20 to 50 times slower than V8. The first
 `New` compiles the bundle (about 200 ms, once per process); each interpreter
-instance in the pool then costs about 20 ms to initialize. After that the
+instance in the pool then costs about 20 ms to initialize, which a script
+render pays every time because its instance is not reused. After that the
 gallery examples under `testdata/examples` render as follows. Each was
 rendered at 800 × 500 on an 8-core laptop with a warm pool; the time is the
 median of seven renders, and the data column counts the data items in the

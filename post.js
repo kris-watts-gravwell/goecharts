@@ -130,11 +130,89 @@
 
   // render renders one JSON option to an SVG string. Unlike a browser render
   // this is synchronous: in server-side rendering mode ECharts lays out and
-  // paints the whole scene inside setOption, and renderToSVGString
-  // serializes it.
+  // paints the whole scene inside setOption, and serializeSVG
+  // writes it out.
+  // --- serialization ---------------------------------------------------------
+  //
+  // serializeSVG writes the chart as an SVG document. It stands in for
+  // chart.renderToSVGString, which builds the same element tree and then
+  // writes attribute values without escaping them: a font family in double
+  // quotes yields a document that is not well-formed, and a colour such as
+  // `red" onload="..."` from an untrusted option becomes a live attribute.
+  // The tree is ECharts' own (the SVG painter's renderToVNode, with the
+  // arguments renderToString passes it); only the writing is done here.
+  var ATTR_UNSAFE = /[&<>"\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/;
+  var TEXT_UNSAFE = /[&<>\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/;
+  // Control characters other than tab, newline and carriage return, and the
+  // noncharacters U+FFFE and U+FFFF, cannot appear in XML 1.0 at all,
+  // escaped or not.
+  var XML_FORBIDDEN = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g;
+  function escapeAttr(v) {
+    v = String(v);
+    if (!ATTR_UNSAFE.test(v)) { return v; }
+    return v.replace(XML_FORBIDDEN, '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+  function escapeText(v) {
+    v = String(v);
+    if (!TEXT_UNSAFE.test(v)) { return v; }
+    return v.replace(XML_FORBIDDEN, '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+  // The painter hands the style sheet over already wrapped in CDATA. Keep
+  // it that way, but do not let a value inside it end the section early.
+  function styleText(text) {
+    var open = '<![CDATA[', close = ']]>';
+    text = String(text).replace(XML_FORBIDDEN, '');
+    if (text.slice(0, open.length) !== open || text.slice(-close.length) !== close) {
+      return escapeText(text);
+    }
+    var css = text.slice(open.length, text.length - close.length);
+    return open + css.split(close).join(']]]]><![CDATA[>') + close;
+  }
+  function writeNode(node, out) {
+    var tag = node.tag, attrs = node.attrs, children = node.children;
+    out.push('<', tag);
+    if (attrs) {
+      for (var key in attrs) {
+        if (!Object.prototype.hasOwnProperty.call(attrs, key)) { continue; }
+        var val = attrs[key];
+        // An attribute without a value is not XML; one whose value is
+        // unknown says nothing, so leave it out.
+        if (val === false || val == null) { continue; }
+        out.push(' ', key, '="', escapeAttr(val), '"');
+      }
+    }
+    out.push('>');
+    if (node.text != null && node.text !== '') {
+      out.push(tag === 'style' ? styleText(node.text) : escapeText(node.text));
+    }
+    if (children && children.length) {
+      for (var i = 0; i < children.length; i++) {
+        out.push('\n');
+        writeNode(children[i], out);
+      }
+      out.push('\n');
+    }
+    out.push('</', tag, '>');
+  }
+  function serializeSVG(chart, useViewBox) {
+    var painter = chart.getZr().painter;
+    if (!painter || typeof painter.renderToVNode !== 'function') {
+      throw new Error('the chart has no SVG painter');
+    }
+    var root = painter.renderToVNode({
+      animation: true, emphasis: true, willUpdate: false, compress: true, useViewBox: useViewBox
+    });
+    var out = [];
+    writeNode(root, out);
+    return out.join('');
+  }
+
   function render(optionText, datasetsText, optsText) {
     var result = { svg: null, error: null };
     var chart = null;
+    renderGeneration++;
     try {
       var option = JSON.parse(optionText);
       var opts = optsText ? JSON.parse(optsText) : {};
@@ -146,11 +224,14 @@
       prepareOption(option, opts);
       chart = newChart(opts);
       chart.setOption(option, { notMerge: true, lazyUpdate: false, silent: true });
-      result.svg = chart.renderToSVGString({ useViewBox: !!opts.useViewBox });
+      result.svg = serializeSVG(chart, !!opts.useViewBox);
     } catch (e) {
       result.error = errorText(e);
     } finally {
       if (chart) { try { chart.dispose(); } catch (e2) { /* ignore */ } }
+      // Timers are never run for a plain option, so drop any that ECharts
+      // queued rather than keep them on a pooled runtime.
+      global.__goecharts_timers.clear();
     }
     return result;
   }
@@ -297,7 +378,32 @@
     this._src = '';
     this._fixedWidth = !!width;
     this._fixedHeight = !!height;
+    // The render in which a synchronous load failed, if it did.
+    this._failedIn = undefined;
   }
+  // zrender keeps the images it loads in a cache that outlives a render on
+  // a pooled runtime, and reads their size through width and height. An
+  // image whose load failed got an assumed size; when a later render reads
+  // it, load it again, so that one render's failure (a loader error, or
+  // its input limit) is not passed on to the next, and the next is charged
+  // for the load.
+  var renderGeneration = 0;
+  function sizeProperty(name) {
+    var key = '_' + name;
+    return {
+      enumerable: true,
+      get: function () {
+        if (this._failedIn !== undefined && this._failedIn !== renderGeneration) {
+          this._failedIn = undefined;
+          loadInto(this, this._src, true);
+        }
+        return this[key];
+      },
+      set: function (v) { this[key] = v; }
+    };
+  }
+  Object.defineProperty(Image.prototype, 'width', sizeProperty('width'));
+  Object.defineProperty(Image.prototype, 'height', sizeProperty('height'));
   Object.defineProperty(Image.prototype, 'src', {
     enumerable: true,
     get: function () { return this._src; },
@@ -306,15 +412,30 @@
   // loadInto sets an image's source and size. Synchronous loads, used for
   // images named in an option, must not fire callbacks: zrender wires its
   // cache up after loadImage returns, and serializes right after setOption.
+  var UNKNOWN_IMAGE_SIZE = 32;
   function loadInto(img, src, sync) {
     img._src = src;
     var size = null, err = null;
     try { size = host.imageSize(src); } catch (e) { err = e; }
     function apply() {
       if (err) {
-        if (!sync && typeof img.onerror === 'function') { img.onerror(err); }
+        if (!sync) {
+          if (typeof img.onerror === 'function') { img.onerror(err); }
+          return;
+        }
+        // An image named in an option whose size cannot be learned (no
+        // image loader, or the load failed). zrender writes a pattern's
+        // tile size from it and would emit valueless width and height
+        // attributes, which is not well-formed XML, so assume a size. An
+        // explicit imageWidth and imageHeight in the option still win.
+        if (!img._fixedWidth) { img.width = UNKNOWN_IMAGE_SIZE; }
+        if (!img._fixedHeight) { img.height = UNKNOWN_IMAGE_SIZE; }
+        img._failedIn = renderGeneration;
+        console.warn('size of image ' + (src.length > 80 ? src.slice(0, 80) + '...' : src) +
+          ' is unknown, assuming ' + UNKNOWN_IMAGE_SIZE + ' x ' + UNKNOWN_IMAGE_SIZE + ': ' + errorText(err));
         return;
       }
+      img._failedIn = undefined;
       img.naturalWidth = size.width;
       img.naturalHeight = size.height;
       if (!img._fixedWidth) { img.width = size.width; }
@@ -385,11 +506,86 @@
   // A canvas element whose 2D context accepts any call and measures text
   // through the host, so a script that paints a pattern or watermark runs
   // through; the pattern itself is not produced.
+  // makeCanvas builds a canvas element. Text is measured through the host,
+  // and the drawing operations that produce pixels a chart reads back or
+  // embeds are carried out on a pixel store in Go (canvas.go): filled
+  // circles and rectangles with a blurred shadow, drawing one canvas onto
+  // another, and reading, writing and exporting pixels. That is what the
+  // heatmap layer of a geo coordinate system uses. Everything else (text,
+  // general paths, strokes, gradients, transforms) is accepted and draws
+  // nothing. The pixel store is only allocated once something needs it.
   function makeCanvas() {
+    var store = null, width = 300, height = 150;
+    var path = [];
+    function pixels() {
+      if (!store) { store = host.canvas(); store.resize(width, height); }
+      return store;
+    }
+    // A colour as [r, g, b, a], or null for one that cannot be drawn, such
+    // as a gradient object.
+    function colorOf(v) {
+      var c = typeof v === 'string' ? echarts.color.parse(v) : null;
+      return c && c.length >= 3 ? [c[0], c[1], c[2], c[3] == null ? 1 : c[3]] : null;
+    }
+    function fillShapes(shapes) {
+      if (!shapes.length) { return; }
+      var f = colorOf(ctx.fillStyle) || [0, 0, 0, 0];
+      var sh = colorOf(ctx.shadowColor) || [0, 0, 0, 0];
+      pixels().fill(shapes, f[0], f[1], f[2], f[3], sh[0], sh[1], sh[2], sh[3],
+        +ctx.shadowBlur || 0, +ctx.shadowOffsetX || 0, +ctx.shadowOffsetY || 0,
+        ctx.globalAlpha == null ? 1 : +ctx.globalAlpha);
+    }
     var ctx = new Proxy({
       canvas: null,
+      globalAlpha: 1,
+      fillStyle: '#000',
+      shadowColor: 'rgba(0,0,0,0)',
+      shadowBlur: 0,
+      shadowOffsetX: 0,
+      shadowOffsetY: 0,
       measureText: function (text) { return { width: host.measureText(String(text), this.font || '10px sans-serif') }; },
-      getImageData: function (x, y, w, h) { return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) }; },
+      beginPath: function () { path = []; },
+      // Only whole circles are drawn; an arc that is part of a larger path
+      // is not.
+      arc: function (x, y, r, start, end) {
+        if (r > 0 && Math.abs(end - start) >= 2 * Math.PI - 1e-6) { path.push(0, +x, +y, +r, 0); }
+      },
+      rect: function (x, y, w, h) {
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        path.push(1, +x, +y, +w, +h);
+      },
+      fill: function () { fillShapes(path); },
+      fillRect: function (x, y, w, h) {
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        fillShapes([1, +x, +y, +w, +h]);
+      },
+      clearRect: function (x, y, w, h) {
+        if (w < 0) { x += w; w = -w; }
+        if (h < 0) { y += h; h = -h; }
+        if (store) { store.clear(x, y, w, h); }
+      },
+      // drawImage(canvas, dx, dy) and drawImage(canvas, dx, dy, dw, dh).
+      // Images are not decoded, so only another canvas can be drawn.
+      drawImage: function (src, dx, dy, dw, dh) {
+        var from = src && typeof src.__pixels === 'function' ? src.__pixels() : null;
+        if (!from || arguments.length > 5) { return; }
+        if (arguments.length < 5) { dw = src.width; dh = src.height; }
+        pixels().draw(from.handle, dx, dy, dw, dh, ctx.globalAlpha == null ? 1 : +ctx.globalAlpha);
+      },
+      createImageData: function (w, h) {
+        return { width: w, height: h, data: new Uint8ClampedArray(w * h * 4) };
+      },
+      getImageData: function (x, y, w, h) {
+        w = Math.max(0, Math.round(w)); h = Math.max(0, Math.round(h));
+        return { width: w, height: h, data: new Uint8ClampedArray(pixels().read(x, y, w, h)) };
+      },
+      putImageData: function (image, x, y) {
+        var d = image.data;
+        var buffer = d.byteOffset === 0 && d.byteLength === d.buffer.byteLength ? d.buffer : d.slice().buffer;
+        pixels().write(buffer, image.width, image.height, x, y);
+      },
       createLinearGradient: function () { return { addColorStop: noop }; },
       createRadialGradient: function () { return { addColorStop: noop }; },
       createPattern: function () { return null; }
@@ -397,10 +593,30 @@
       get: function (target, key) { return key in target ? target[key] : (typeof key === 'string' ? noop : undefined); }
     });
     var canvas = makeElement('canvas');
-    canvas.width = 300;
-    canvas.height = 150;
-    canvas.getContext = function () { return ctx; };
-    canvas.toDataURL = function () { return ''; };
+    // Assigning either dimension clears the canvas, as in a browser.
+    function dimension(get, set) {
+      return {
+        enumerable: true,
+        get: get,
+        set: function (v) {
+          v = Math.max(0, Math.floor(+v) || 0);
+          set(v);
+          if (store) { store.resize(width, height); }
+        }
+      };
+    }
+    Object.defineProperty(canvas, 'width', dimension(function () { return width; }, function (v) { width = v; }));
+    Object.defineProperty(canvas, 'height', dimension(function () { return height; }, function (v) { height = v; }));
+    canvas.getContext = function (type) { return type === '2d' || type == null ? ctx : null; };
+    // __pixels returns the pixel store, or null while nothing was drawn.
+    canvas.__pixels = function () { return store; };
+    // A canvas nothing was drawn on exports as a blank image of its own
+    // size, so that a pattern made from it still tiles at the right pitch.
+    canvas.toDataURL = function () {
+      if (store) { return store.dataURL(); }
+      return 'data:image/svg+xml,' + encodeURIComponent(
+        '<svg xmlns="http://www.w3.org/2000/svg" width="' + width + '" height="' + height + '"/>');
+    };
     ctx.canvas = canvas;
     return canvas;
   }
@@ -483,6 +699,7 @@
   // Image elements in an option (`image` graphics, symbol images, patterns)
   // go through the same Image so that they carry their natural size.
   echarts.setPlatformAPI({
+    createCanvas: makeCanvas,
     loadImage: function (src) {
       var img = new Image();
       loadInto(img, String(src), true);
@@ -612,6 +829,7 @@
   function prepareScript(scriptText, datasetsText, optsText) {
     var state = { chart: null, opts: null, datasets: {}, setCalled: false, option: undefined, error: null };
     pending = state;
+    renderGeneration++;
     timers.clear();
     try {
       state.opts = optsText ? JSON.parse(optsText) : {};
@@ -667,7 +885,7 @@
       if (!state.setCalled) {
         throw new Error('script did not assign option or call myChart.setOption');
       }
-      result.svg = state.chart.renderToSVGString({ useViewBox: !!state.opts.useViewBox });
+      result.svg = serializeSVG(state.chart, !!state.opts.useViewBox);
     } catch (e) {
       result.error = errorText(e);
     } finally {

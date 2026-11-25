@@ -27,6 +27,17 @@ type jsRuntime struct {
 
 	// ctx is the context of the render in progress, used by loads.
 	ctx context.Context
+	// script is set while the render in progress runs a script.
+	script bool
+
+	// inputLeft is how many more bytes the render in progress may load
+	// before it exceeds the input limit; negative means no limit. limitErr
+	// records the first size limit the render hit, so that the render
+	// fails with it even if the script caught the error thrown at it.
+	inputLeft int64
+	limitErr  error
+	// canvasPixels counts the canvas pixels the render has allocated.
+	canvasPixels int64
 
 	// Messages ECharts logged at error level during the current render.
 	loggedErrors []string
@@ -43,6 +54,7 @@ func newJSRuntime(r *Renderer) (*jsRuntime, error) {
 	_ = host.Set("load", rt.hostLoad)
 	_ = host.Set("parseXML", rt.hostParseXML)
 	_ = host.Set("imageSize", rt.hostImageSize)
+	_ = host.Set("canvas", rt.hostCanvas)
 	_ = vm.Set("__goecharts_host", host)
 
 	console := vm.NewObject()
@@ -78,7 +90,11 @@ func newJSRuntime(r *Renderer) (*jsRuntime, error) {
 // reset clears per-render state so the runtime can be pooled.
 func (rt *jsRuntime) reset() {
 	rt.loggedErrors = nil
+	rt.limitErr = nil
+	rt.inputLeft = -1
+	rt.canvasPixels = 0
 	rt.ctx = nil
+	rt.script = false
 	rt.vm.ClearInterrupt()
 	if len(rt.fontCache) > 4096 {
 		rt.fontCache = map[string]Font{}
@@ -88,10 +104,11 @@ func (rt *jsRuntime) reset() {
 func (rt *jsRuntime) render(ctx context.Context, option, data, opts string) ([]byte, error) {
 	stop := rt.begin(ctx)
 	defer stop()
+	rt.script = false
 	vm := rt.vm
 	resultV, err := rt.renderFn(goja.Undefined(), vm.ToValue(option), vm.ToValue(data), vm.ToValue(opts))
 	if err != nil {
-		return nil, wrapJSError(err)
+		return nil, rt.wrapError(err)
 	}
 	return rt.result(resultV)
 }
@@ -103,15 +120,16 @@ func (rt *jsRuntime) render(ctx context.Context, option, data, opts string) ([]b
 func (rt *jsRuntime) renderScript(ctx context.Context, script, data, opts string) ([]byte, error) {
 	stop := rt.begin(ctx)
 	defer stop()
+	rt.script = true
 	vm := rt.vm
 	if _, err := rt.prepareFn(goja.Undefined(), vm.ToValue(script), vm.ToValue(data), vm.ToValue(opts)); err != nil {
 		// Leave no half-built chart behind for the next render.
 		_, _ = rt.finishFn(goja.Undefined())
-		return nil, wrapJSError(err)
+		return nil, rt.wrapError(err)
 	}
 	resultV, err := rt.finishFn(goja.Undefined())
 	if err != nil {
-		return nil, wrapJSError(err)
+		return nil, rt.wrapError(err)
 	}
 	return rt.result(resultV)
 }
@@ -142,6 +160,9 @@ func (rt *jsRuntime) begin(ctx context.Context) (stop func()) {
 
 // result extracts the SVG from a {svg, error} result object.
 func (rt *jsRuntime) result(resultV goja.Value) ([]byte, error) {
+	if rt.limitErr != nil {
+		return nil, rt.limitErr
+	}
 	result, ok := resultV.(*goja.Object)
 	if !ok {
 		return nil, errors.New("echarts: render returned no result object")
@@ -156,7 +177,39 @@ func (rt *jsRuntime) result(resultV goja.Value) ([]byte, error) {
 	if svg == nil || goja.IsNull(svg) || goja.IsUndefined(svg) {
 		return nil, errors.New("echarts: render produced no SVG")
 	}
-	return []byte(svg.String()), nil
+	out := svg.String()
+	if max := rt.r.opts.maxOutput; max > 0 && int64(len(out)) > max {
+		return nil, fmt.Errorf("%w: SVG is %d bytes, limit %d", ErrOutputTooLarge, len(out), max)
+	}
+	return []byte(out), nil
+}
+
+// wrapError converts an error from running JavaScript. A size limit hit
+// during the render wins over whatever the script made of it, unless the
+// render was interrupted.
+func (rt *jsRuntime) wrapError(err error) error {
+	if _, ok := errors.AsType[*goja.InterruptedError](err); !ok && rt.limitErr != nil {
+		return rt.limitErr
+	}
+	return wrapJSError(err)
+}
+
+// chargeInput counts n loaded bytes against the render's input limit and
+// reports whether they fit.
+func (rt *jsRuntime) chargeInput(url string, n int) error {
+	if rt.inputLeft < 0 {
+		return nil
+	}
+	if int64(n) > rt.inputLeft {
+		err := fmt.Errorf("%w: loading %s (%d bytes) passes the limit of %d", ErrInputTooLarge, url, n, rt.r.opts.maxInput)
+		if rt.limitErr == nil {
+			rt.limitErr = err
+		}
+		rt.inputLeft = 0
+		return err
+	}
+	rt.inputLeft -= int64(n)
+	return nil
 }
 
 func wrapJSError(err error) error {
@@ -190,15 +243,32 @@ func (rt *jsRuntime) hostLoad(call goja.FunctionCall) goja.Value {
 	if loader == nil {
 		panic(rt.vm.NewGoError(fmt.Errorf("loading is disabled (no Loader configured): %s", url)))
 	}
+	b, err := rt.fetch(loader, url)
+	if err != nil {
+		panic(rt.vm.NewGoError(err))
+	}
+	return rt.vm.ToValue(string(b))
+}
+
+// fetch loads url through loader and counts it against the input limit.
+// The context it passes tells the loader how much it may return; see
+// LoadLimit.
+func (rt *jsRuntime) fetch(loader Loader, url string) ([]byte, error) {
 	ctx := rt.ctx
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if rt.inputLeft >= 0 {
+		ctx = context.WithValue(ctx, loadLimitKey{}, rt.inputLeft)
+	}
 	b, err := loader.Load(ctx, url)
 	if err != nil {
-		panic(rt.vm.NewGoError(fmt.Errorf("loading %s: %w", url, err)))
+		return nil, fmt.Errorf("loading %s: %w", url, err)
 	}
-	return rt.vm.ToValue(string(b))
+	if err := rt.chargeInput(url, len(b)); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (rt *jsRuntime) hostMeasureText(call goja.FunctionCall) goja.Value {

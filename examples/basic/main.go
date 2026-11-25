@@ -12,7 +12,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/kris-watts-gravwell/goecharts"
+	"github.com/gravwell/goecharts"
 )
 
 const option = `{

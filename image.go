@@ -8,10 +8,10 @@ package goecharts
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"fmt"
 	"image"
+	"net/url"
 	"strings"
 
 	// Formats that image.DecodeConfig can read the size of.
@@ -24,7 +24,10 @@ import (
 
 // hostImageSize(src) resolves an image source and returns its pixel size as
 // {width, height}. A data: URL is decoded in place; anything else goes
-// through the Loader. Only the header is decoded, so the cost is the fetch.
+// through the image loader (WithImageLoader). Plain options reach this too,
+// so the script Loader stands in for a missing image loader only while a
+// script renders, when it can reach that Loader anyway. Only the header is
+// decoded, so the cost is the fetch.
 func (rt *jsRuntime) hostImageSize(call goja.FunctionCall) goja.Value {
 	src := call.Argument(0).String()
 	var data []byte
@@ -38,24 +41,28 @@ func (rt *jsRuntime) hostImageSize(call goja.FunctionCall) goja.Value {
 		if strings.HasSuffix(meta, ";base64") {
 			data, err = base64.StdEncoding.DecodeString(payload)
 		} else {
-			data = []byte(payload)
+			// The payload should be percent-encoded, but hand-written SVG
+			// often carries a bare '%' (width:100%); read that as it is.
+			if text, uerr := url.PathUnescape(payload); uerr == nil {
+				data = []byte(text)
+			} else {
+				data = []byte(payload)
+			}
 		}
 		if err != nil {
 			panic(rt.vm.NewGoError(fmt.Errorf("decoding data URL: %w", err)))
 		}
 	} else {
-		loader := rt.r.opts.loader
-		if loader == nil {
-			panic(rt.vm.NewGoError(fmt.Errorf("loading is disabled (no Loader configured): %s", src)))
+		loader := rt.r.opts.imageLoader
+		if loader == nil && rt.script {
+			loader = rt.r.opts.loader
 		}
-		ctx := rt.ctx
-		if ctx == nil {
-			ctx = context.Background()
+		if loader == nil {
+			panic(rt.vm.NewGoError(fmt.Errorf("image loading is disabled (no image loader configured): %s", src)))
 		}
 		var err error
-		data, err = loader.Load(ctx, src)
-		if err != nil {
-			panic(rt.vm.NewGoError(fmt.Errorf("loading %s: %w", src, err)))
+		if data, err = rt.fetch(loader, src); err != nil {
+			panic(rt.vm.NewGoError(err))
 		}
 	}
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))

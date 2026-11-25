@@ -1,4 +1,4 @@
-module github.com/kris-watts-gravwell/goecharts
+module github.com/gravwell/goecharts
 
 go 1.27.4
 
@@ -11,4 +11,4 @@ require (
 	golang.org/x/text v0.43.0 // indirect
 )
 
-tool github.com/kris-watts-gravwell/goecharts/tools/demo
+tool github.com/gravwell/goecharts/tools/demo

@@ -46,7 +46,7 @@ import (
 	_ "embed"
 
 	"github.com/dop251/goja"
-	"github.com/kris-watts-gravwell/goecharts/internal/jsdist"
+	"github.com/gravwell/goecharts/internal/jsdist"
 )
 
 //go:embed pre.js
@@ -65,6 +65,17 @@ type Error struct {
 }
 
 func (e *Error) Error() string { return "echarts: " + e.Msg }
+
+// Errors for a render that exceeds a size limit; test for them with
+// errors.Is.
+var (
+	// ErrInputTooLarge reports that the request and the data it loaded
+	// exceed the limit set with WithMaxInputBytes.
+	ErrInputTooLarge = errors.New("echarts: input exceeds the size limit")
+	// ErrOutputTooLarge reports that the SVG exceeds the limit set with
+	// WithMaxOutputBytes.
+	ErrOutputTooLarge = errors.New("echarts: output exceeds the size limit")
+)
 
 // Default output dimensions in CSS pixels, used when a Request leaves
 // Width or Height zero.
@@ -123,6 +134,9 @@ type Renderer struct {
 	pre, bundle, post *goja.Program
 
 	pool chan *jsRuntime
+
+	// slots limits the number of renders in progress; nil means no limit.
+	slots chan struct{}
 }
 
 var (
@@ -137,15 +151,23 @@ var (
 // between all Renderers in the process and happens once.
 func New(opts ...Option) (*Renderer, error) {
 	o := options{
-		poolSize:    runtime.NumCPU(),
-		timeout:     30 * time.Second,
-		measurer:    DefaultTextMeasurer,
-		failOnError: true,
+		poolSize:   runtime.NumCPU(),
+		maxRenders: runtime.GOMAXPROCS(0),
+		maxInput:   DefaultMaxInputBytes,
+		maxOutput:  DefaultMaxOutputBytes,
+
+		maxCanvasPixels: DefaultMaxCanvasPixels,
+		timeout:         30 * time.Second,
+		measurer:        DefaultTextMeasurer,
+		failOnError:     true,
 	}
 	for _, opt := range opts {
 		opt(&o)
 	}
 	r := &Renderer{opts: o, pool: make(chan *jsRuntime, o.poolSize)}
+	if o.maxRenders > 0 {
+		r.slots = make(chan struct{}, o.maxRenders)
+	}
 	if err := r.compile(); err != nil {
 		return nil, err
 	}
@@ -196,6 +218,36 @@ func (r *Renderer) Render(ctx context.Context, req Request) (svg []byte, err err
 	if err != nil {
 		return nil, err
 	}
+	// optsJSON carries the theme; the rest of it is a few fixed fields.
+	inputLeft := int64(-1)
+	if max := r.opts.maxInput; max > 0 {
+		used := int64(len(req.Option)) + int64(len(req.Script)) + int64(len(dataJSON)) + int64(len(optsJSON))
+		if used > max {
+			return nil, fmt.Errorf("%w: request is %d bytes, limit %d", ErrInputTooLarge, used, max)
+		}
+		inputLeft = max - used
+	}
+	// Wait for a render slot before the timeout starts, so that time spent
+	// queued behind other renders does not count against this one. The
+	// wait has a timeout of its own, so that a caller without a deadline
+	// is not held forever by renders that never finish.
+	if r.slots != nil {
+		wait, cancel := ctx, context.CancelFunc(func() {})
+		if r.opts.timeout > 0 {
+			wait, cancel = context.WithTimeout(ctx, r.opts.timeout)
+		}
+		select {
+		case r.slots <- struct{}{}:
+			cancel()
+			defer func() { <-r.slots }()
+		case <-wait.Done():
+			cancel()
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("echarts: no render slot came free within %v: %w", r.opts.timeout, context.DeadlineExceeded)
+		}
+	}
 	if r.opts.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.opts.timeout)
@@ -220,6 +272,7 @@ func (r *Renderer) Render(ctx context.Context, req Request) (svg []byte, err err
 		}
 	}()
 
+	rt.inputLeft = inputLeft
 	if hasScript {
 		svg, err = rt.renderScript(ctx, string(req.Script), string(dataJSON), string(optsJSON))
 	} else {
@@ -234,10 +287,15 @@ func (r *Renderer) Render(ctx context.Context, req Request) (svg []byte, err err
 			}
 			return nil, err
 		}
-		healthy = true
+		healthy = !hasScript
 		return nil, err
 	}
-	healthy = true
+	// A script runs caller-supplied code in the runtime's global scope and
+	// can change anything there (JSON.parse, the echarts object, the host
+	// bindings), so a runtime that ran one is never handed to another
+	// render. Only the runtime start-up is paid again; the compiled
+	// programs are shared.
+	healthy = !hasScript
 	return svg, nil
 }
 

@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kris-watts-gravwell/goecharts"
+	"github.com/gravwell/goecharts"
 )
 
 type dataFlags map[string]string

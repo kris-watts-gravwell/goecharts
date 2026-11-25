@@ -9,10 +9,12 @@ package goecharts
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"strings"
 	"testing"
 )
@@ -53,7 +55,7 @@ func shimRenderer(t *testing.T) *Renderer {
 		}
 		return nil, fmt.Errorf("not found")
 	})
-	r, err := New(WithLoader(loader), WithPoolSize(2))
+	r, err := New(WithLoader(loader), WithImageLoader(loader), WithPoolSize(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,6 +251,53 @@ func TestShimCanvasWatermark(t *testing.T) {
 	if !strings.Contains(s, "wm ") || strings.Contains(s, "wm 0") {
 		t.Errorf("SVG title: %s", titleOf([]byte(s)))
 	}
+	// The pattern tiles at the size of the canvas it was made from.
+	checkWellFormed(t, []byte(s))
+	if !strings.Contains(s, `<pattern width="100" height="100"`) {
+		t.Errorf("pattern does not carry the canvas size: %.300s", s[strings.Index(s, "<pattern"):])
+	}
+}
+
+// A pattern image whose size cannot be learned still yields a well-formed
+// document: zrender would otherwise write valueless width and height
+// attributes.
+func TestUnknownImageSize(t *testing.T) {
+	const option = `{"xAxis":{"type":"category","data":["a"]},"yAxis":{},
+		"series":[{"type":"bar","data":[1],
+		"itemStyle":{"color":{"image":"https://img.test/p.png","repeat":"repeat"}}}]}`
+	var warned bool
+	r, err := New(WithLogger(func(level, msg string) {
+		if level == "warn" && strings.Contains(msg, "https://img.test/p.png") {
+			warned = true
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svg, err := r.RenderSVG(context.Background(), []byte(option), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkWellFormed(t, svg)
+	if !strings.Contains(string(svg), `<pattern width="32" height="32"`) {
+		t.Errorf("pattern has no assumed size: %s", svg)
+	}
+	if !warned {
+		t.Error("no warning about the unknown image size")
+	}
+}
+
+// checkWellFormed fails the test unless svg parses as XML.
+func checkWellFormed(t *testing.T, svg []byte) {
+	t.Helper()
+	d := xml.NewDecoder(bytes.NewReader(svg))
+	for {
+		if _, err := d.Token(); err == io.EOF {
+			return
+		} else if err != nil {
+			t.Fatalf("SVG is not well-formed XML: %v", err)
+		}
+	}
 }
 
 func titleOf(svg []byte) string {
@@ -262,4 +311,96 @@ func titleOf(svg []byte) string {
 		return s[i:]
 	}
 	return s[i : i+j]
+}
+
+// An image whose load failed in one render is loaded again by the next on
+// the same pooled runtime, rather than keeping its assumed size.
+func TestFailedImageNotCached(t *testing.T) {
+	var tile bytes.Buffer
+	if err := png.Encode(&tile, image.NewRGBA(image.Rect(0, 0, 24, 16))); err != nil {
+		t.Fatal(err)
+	}
+	fail := true
+	loader := LoaderFunc(func(ctx context.Context, url string) ([]byte, error) {
+		if fail {
+			return nil, fmt.Errorf("temporarily unavailable")
+		}
+		return tile.Bytes(), nil
+	})
+	r, err := New(WithImageLoader(loader), WithPoolSize(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const option = `{"xAxis":{"type":"category","data":["a"]},"yAxis":{},
+		"series":[{"type":"bar","data":[1],
+		"itemStyle":{"color":{"image":"https://img.test/retry.png","repeat":"repeat"}}}]}`
+	svg, err := r.RenderSVG(context.Background(), []byte(option), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(svg), `<pattern width="32" height="32"`) {
+		t.Fatalf("failed image has no assumed size: %s", svg)
+	}
+	fail = false
+	svg, err = r.RenderSVG(context.Background(), []byte(option), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(svg), `<pattern width="24" height="16"`) {
+		t.Errorf("image not loaded again after a failure: %s", svg)
+	}
+}
+
+// A script's images go through the script Loader when there is no image
+// loader; an option's do not.
+func TestImageFallsBackToLoader(t *testing.T) {
+	var tile bytes.Buffer
+	if err := png.Encode(&tile, image.NewRGBA(image.Rect(0, 0, 24, 16))); err != nil {
+		t.Fatal(err)
+	}
+	loads := 0
+	loader := LoaderFunc(func(ctx context.Context, url string) ([]byte, error) {
+		loads++
+		return tile.Bytes(), nil
+	})
+	r, err := New(WithLoader(loader))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := renderScript(t, r, `
+	  const img = new Image();
+	  img.onload = function () { option = { title: { text: 'img ' + img.width + 'x' + img.height } }; };
+	  img.onerror = function () { option = { title: { text: 'img failed' } }; };
+	  img.src = '/img/tile.png';`)
+	if !strings.Contains(s, "img 24x16") {
+		t.Errorf("SVG title: %s", titleOf([]byte(s)))
+	}
+	loads = 0
+	const option = `{"xAxis":{"type":"category","data":["a"]},"yAxis":{},
+		"series":[{"type":"bar","data":[1],
+		"itemStyle":{"color":{"image":"https://img.test/p.png","repeat":"repeat"}}}]}`
+	if _, err := r.RenderSVG(context.Background(), []byte(option), nil); err != nil {
+		t.Fatal(err)
+	}
+	if loads != 0 {
+		t.Error("a plain option reached the script Loader")
+	}
+}
+
+// An SVG data URL may carry a bare '%' that is not an escape.
+func TestDataURLBarePercent(t *testing.T) {
+	r, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const option = `{"xAxis":{"type":"category","data":["a"]},"yAxis":{},
+		"series":[{"type":"bar","data":[1],
+		"itemStyle":{"color":{"image":"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='20' height='10' style='width:100%'/>","repeat":"repeat"}}}]}`
+	svg, err := r.RenderSVG(context.Background(), []byte(option), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(svg), `<pattern width="20" height="10"`) {
+		t.Errorf("pattern size not read from the data URL: %s", svg)
+	}
 }
